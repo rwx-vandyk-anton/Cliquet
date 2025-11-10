@@ -1,41 +1,39 @@
-import numpy as np
-import pandas as pd
-from typing import Callable, List
-from datetime import date
-
-
 def price_autocall(
     paths_df: pd.DataFrame,
     initial_spot: float,
-    observation_dates: List[date],
-    barrier: float,  # e.g. 0.6 for 60%
-    discount_factor: Callable[[date], float],  # DF to each obs/maturity
+    barrier: float,  # expressed as fraction of S0 (e.g. 0.6)
+    discount_factor: Callable[[date], float],
     notional: float = 1.0,
 ) -> float:
     """
-    Price an equity autocallable with:
-      - annual observations
-      - autocall if S_t > initial_spot
-      - coupon = number_of_years until call
-      - maturity payoff:
-          * if S_T > S0:   notional*(1+years)
-          * if barrier < S_T < S0: notional*(S_T/S0)
-          * if S_T < barrier*S0:   0
+    Price an equity autocallable using GBM paths.
+
+    Autocall rule:
+        If S(t) > S0 at an observation date:
+            payoff = notional * (1 + elapsed_years)
+            discounted back to today
+            terminate
+
+    Maturity payoff (if no autocall):
+        If S_T > S0:
+            payoff = notional * (1 + elapsed_years_total)
+        elif S_T > barrier*S0:
+            payoff = notional * (S_T / S0)
+        else:
+            payoff = 0
 
     Parameters
     ----------
     paths_df : pd.DataFrame
-        DataFrame: index = dates, columns = Sim_1 .. Sim_n, values = S_t.
+        DataFrame with index = dates, columns = Sim_i.
     initial_spot : float
         Initial index level S0.
-    observation_dates : list of date
-        Same order as DataFrame index.
     barrier : float
-        Barrier as FRACTION of S0 (e.g. 0.6 = 60%).
+        Barrier fraction (e.g. 0.6 = 60%).
     discount_factor : Callable[[date], float]
-        Function returning DF(today, date).
+        DF(today, date).
     notional : float
-        Investment amount (default 1.0).
+        Notional invested.
 
     Returns
     -------
@@ -44,42 +42,47 @@ def price_autocall(
     """
 
     S0 = float(initial_spot)
-    paths = paths_df.values       # shape (num_dates, num_sims)
     dates = list(paths_df.index)
-    n_dates, n_sims = paths.shape
-
-    if n_dates != len(observation_dates):
-        raise ValueError("observation_dates must align with DataFrame index")
+    dates_arr = np.array(dates)
+    n_dates = len(dates)
+    paths = paths_df.values  # shape (dates, sims)
+    n_sims = paths.shape[1]
 
     barrier_level = barrier * S0
 
     payoffs = np.zeros(n_sims)
 
-    # Loop over each simulation path
+    # Helper to get ACT/365 year-fraction
+    def yf(d0, d1):
+        return (d1 - d0).days / 365.0
+
     for sim in range(n_sims):
 
         autocalled = False
 
+        # Loop through observation dates EXCLUDING maturity
         for j in range(n_dates - 1):
+
             S_t = paths[j, sim]
-            if S_t > S0:
-                # autocall triggered at observation j
-                years = j + 1  # zero-based index: j=0 => year 1
-                payoff = notional * (1 + years)
-                df = discount_factor(observation_dates[j])
-                payoffs[sim] = payoff * df
+            obs_date = dates[j]
+
+            if S_t > S0:  # autocall trigger
+                elapsed_years = yf(dates[0], obs_date)
+                payoff = notional * (1 + elapsed_years)
+                payoffs[sim] = payoff * discount_factor(obs_date)
                 autocalled = True
                 break
 
         if autocalled:
             continue
 
-        # --- maturity payoff ---
+        # ---------- maturity payoff ----------
         S_T = paths[-1, sim]
+        maturity_date = dates[-1]
+        total_years = yf(dates[0], maturity_date)
 
         if S_T > S0:
-            years = n_dates
-            payoff = notional * (1 + years)
+            payoff = notional * (1 + total_years)
 
         elif S_T > barrier_level:
             payoff = notional * (S_T / S0)
@@ -87,8 +90,6 @@ def price_autocall(
         else:
             payoff = 0.0
 
-        df_T = discount_factor(observation_dates[-1])
-        payoffs[sim] = payoff * df_T
+        payoffs[sim] = payoff * discount_factor(maturity_date)
 
-    # Monte Carlo price = expectation
     return float(np.mean(payoffs))
